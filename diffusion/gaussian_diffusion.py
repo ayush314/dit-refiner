@@ -212,18 +212,25 @@ class GaussianDiffusion:
         log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, t, noise=None, mask=None):
         """
         Diffuse the data for a given number of diffusion steps.
         In other words, sample from q(x_t | x_0).
         :param x_start: the initial data batch.
         :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
         :param noise: if specified, the split-out normal noise.
+        :param mask: if specified, a mask of the same shape as x_start.
+                    Noise is only applied where mask is 1.
         :return: A noisy version of x_start.
         """
         if noise is None:
             noise = th.randn_like(x_start)
         assert noise.shape == x_start.shape
+
+        if mask is not None:
+            assert mask.shape == x_start.shape, "Mask must have the same shape as x_start"
+            noise = noise * mask
+
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
@@ -712,7 +719,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, mask=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -721,6 +728,8 @@ class GaussianDiffusion:
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
+        :param mask: if specified, a mask of the same shape as x_start.
+                    Loss is only computed for masked-in elements.
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
@@ -728,7 +737,7 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)
+        x_t = self.q_sample(x_start, t, noise=noise, mask=mask)
 
         terms = {}
 
@@ -750,9 +759,20 @@ class GaussianDiffusion:
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                model_output, model_var_values = th.split(model_output, C, dim=1)
+                # B, C = x_t.shape[:2]
+                # assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+                # model_output, model_var_values = th.split(model_output, C, dim=1)
+                
+                # The original code was for images (B, C, H, W) and split on the channel dim (C).
+                # Our data is (B, L, F), and we need to split on the feature dim (F), which is the last one.
+                num_features = x_t.shape[-1]
+                
+                # Assert that the model output has double the features on the last dimension
+                assert model_output.shape == x_t.shape[:-1] + (num_features * 2,)
+                
+                # Split the output into mean (epsilon) and variance predictions along the last dimension
+                model_output, model_var_values = th.split(model_output, num_features, dim=-1)
+
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
@@ -776,7 +796,17 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            
+            mse = (target - model_output) ** 2
+            if mask is not None:
+                assert mask.shape == mse.shape
+                # We want to average the loss over the number of diffused elements,
+                # not all elements.
+                mse = mse * mask
+                terms["mse"] = mean_flat(mse) / mean_flat(mask) # Normalize by number of active elements
+            else:
+                terms["mse"] = mean_flat(mse)
+
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

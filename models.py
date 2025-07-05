@@ -115,9 +115,9 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), attn_mask) #add attention mask
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -126,10 +126,10 @@ class FinalLayer(nn.Module):
     """
     The final layer of DiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, out_features):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.linear = nn.Linear(hidden_size, out_features, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -148,35 +148,34 @@ class DiT(nn.Module):
     """
     def __init__(
         self,
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
+        max_len=256,
+        in_features=12,
         hidden_size=1152,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
-        num_classes=1000,
+        num_classes=1,
         learn_sigma=True,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
-        self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.patch_size = patch_size
+        self.in_features = in_features
+        self.out_features = in_features * 2 if learn_sigma else in_features
+        self.max_len = max_len
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = nn.Linear(self.in_features, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
+        
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, self.out_features)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -189,13 +188,12 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        pos_embed = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.pos_embed.shape[1])
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        nn.init.xavier_uniform_(self.x_embedder.weight)
+        nn.init.constant_(self.x_embedder.bias, 0)
 
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
@@ -215,36 +213,22 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, attn_mask=None):
         """
         Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+        x: (N, L, F) tensor of protein backbone coordinates (L=max_len, F=input_features)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: (N,) tensor of class labels (can be dummy)
+        attn_mask: (N, L, L) attention mask
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        # x starts as (N, L, 12)
+        x = self.x_embedder(x) + self.pos_embed  # (N, L, D)
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+            x = block(x, c, attn_mask)                      # (N, L, D)
+        x = self.final_layer(x, c)               # (N, L, out_features)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
@@ -270,6 +254,18 @@ class DiT(nn.Module):
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+
+def get_1d_sincos_pos_embed(embed_dim, length):
+    """
+    Generates 1D sinusoidal positional embedding.
+    """
+    pos = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+    pos_embed = torch.zeros(length, embed_dim)
+    pos_embed[:, 0::2] = torch.sin(pos * div_term)
+    pos_embed[:, 1::2] = torch.cos(pos * div_term)
+    return pos_embed.numpy()
+
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """
@@ -325,6 +321,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #                                   DiT Configs                                  #
 #################################################################################
 
+def DiT_XL_Protein(**kwargs):
+    return DiT(depth=28, hidden_size=1152, num_heads=16, **kwargs)
+
 def DiT_XL_2(**kwargs):
     return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
@@ -362,7 +361,7 @@ def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-DiT_models = {
+DiT_models = {'DiT-XL-Protein': DiT_XL_Protein,
     'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
     'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
     'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
